@@ -1,0 +1,732 @@
+# app.py
+import streamlit as st
+import pandas as pd
+import numpy as np
+import plotly.express as px
+import plotly.graph_objects as go
+from datetime import datetime, timedelta
+from ortools.sat.python import cp_model
+
+from engine import (
+    generate_sample_data,
+    generate_feasible_test_data,
+    calculate_train_score,
+    generate_operational_inputs,
+    extend_train_schema_for_constraints,
+    _cert_valid_for_service,
+    optimize_schedule,
+)
+
+# Page & Style
+# ───────────────────────────────────────────────────────────────────────────────
+st.set_page_config(
+    page_title="Kochi Metro AI Train Scheduler",
+    page_icon="🚇",
+    layout="wide",
+    initial_sidebar_state="expanded"
+)
+
+st.markdown("""
+<style>
+    .main-header {
+        font-size: 2.5rem;
+        color: #1E40AF;
+        text-align: center;
+        padding: 1rem;
+        background: linear-gradient(90deg, #3B82F6 0%, #1E40AF 100%);
+        -webkit-background-clip: text;
+        -webkit-text-fill-color: transparent;
+    }
+    .metric-card {
+        background-color: #F3F4F6;
+        padding: 1rem;
+        border-radius: 0.5rem;
+        margin: 0.5rem 0;
+    }
+    .alert-box {
+        padding: 1rem;
+        border-radius: 0.5rem;
+        margin: 1rem 0;
+    }
+    .alert-critical {
+        background-color: #FEE2E2;
+        border-left: 4px solid #EF4444;
+    }
+    .alert-warning {
+        background-color: #FEF3C7;
+        border-left: 4px solid #F59E0B;
+    }
+    .alert-success {
+        background-color: #D1FAE5;
+        border-left: 4px solid #10B981;
+    }
+</style>
+""", unsafe_allow_html=True)
+
+# Session State
+# ───────────────────────────────────────────────────────────────────────────────
+if 'train_data' not in st.session_state:
+    st.session_state.train_data = None
+if 'optimization_results' not in st.session_state:
+    st.session_state.optimization_results = None
+if 'historical_data' not in st.session_state:
+    st.session_state.historical_data = []
+
+def main():
+    st.markdown('<h1 class="main-header">🚇 Kochi Metro AI Train Induction System</h1>', unsafe_allow_html=True)
+    st.markdown("### Intelligent Fleet Management & Optimization Platform")
+
+    # Sidebar controls
+    with st.sidebar:
+        st.header("⚙️ Control Panel")
+
+        st.subheader("Optimization Weights")
+        weights = {
+            'mileage'     : st.slider("Mileage Balance",      0.0, 2.0, 1.0, 0.1),
+            'certificates': st.slider("Certificate Validity", 0.0, 2.0, 1.2, 0.1),
+            'branding'    : st.slider("Branding Priority",    0.0, 2.0, 1.5, 0.1),
+            'cleaning'    : st.slider("Cleaning Schedule",    0.0, 2.0, 0.8, 0.1),
+            'stabling'    : st.slider("Stabling Position",    0.0, 2.0, 0.6, 0.1)
+        }
+
+        st.subheader("Fleet Requirements")
+        required_trains = st.number_input("Trains Needed for Service", min_value=10, max_value=25, value=18)
+
+        st.divider()
+
+        if st.button("🔄 Generate New Data", type="secondary"):
+            st.session_state.train_data = None
+            st.rerun()
+            
+        if st.button("✅ Load Feasible Test Data", type="secondary", help="Loads test data guaranteed to work with optimization"):
+            st.session_state.train_data = generate_feasible_test_data(required_trains)
+            st.success(f"✅ Loaded feasible test data with {required_trains + 5} eligible trains for {required_trains} required services!")
+            st.rerun()
+
+        if st.button("🚀 Run Optimization", type="primary"):
+            with st.spinner("Optimizing full plan (service + bays + cleaning + branding + mileage)..."):
+                df_base = st.session_state.train_data
+                df_ext  = extend_train_schema_for_constraints(df_base)
+                df_diagrams, df_slots, df_bays = generate_operational_inputs(required_trains)
+                plan = optimize_schedule(df_ext, df_diagrams, df_slots, df_bays, weights)
+                
+                # Store results
+                st.session_state.optimization_results = {
+                    "plan": plan,
+                    "diagrams": df_diagrams,
+                    "slots": df_slots,
+                    "bays": df_bays,
+                    "trains_ext": df_ext
+                }
+                st.session_state.historical_data.append({
+                    'timestamp': datetime.now(),
+                    'results': plan.get("service", []),
+                    'weights': weights
+                })
+                
+                # Provide detailed feedback based on optimization status
+                eligibility_mode_names = {
+                    "perfect": "strict constraints",
+                    "valid_certs": "valid certificates", 
+                    "relaxed_certs": "relaxed certificate constraints",
+                    "emergency": "emergency mode"
+                }
+                mode_used = eligibility_mode_names.get(plan.get("eligibility_mode", "unknown"), "unknown mode")
+                
+                if plan["status"] == cp_model.OPTIMAL:
+                    st.success(f"✅ **Optimization Complete!** Found optimal solution using {mode_used} with {len(plan['service'])} service assignments, {len(plan['standby'])} standby, {len(plan['ibl'])} IBL trains. Check the 'Optimization Results' tab for details.")
+                elif plan["status"] == cp_model.FEASIBLE:
+                    st.warning(f"⚠️ **Optimization Complete!** Found feasible solution using {mode_used} with {len(plan['service'])} service assignments, {len(plan['standby'])} standby, {len(plan['ibl'])} IBL trains. Check the 'Optimization Results' tab for details.")
+                else:
+                    status_names = {cp_model.INFEASIBLE: "INFEASIBLE", cp_model.MODEL_INVALID: "MODEL_INVALID", cp_model.UNKNOWN: "UNKNOWN"}
+                    status_name = status_names.get(plan["status"], f"Status {plan['status']}")
+                    
+                    # Add debugging information
+                    total_trains = len(df_ext)
+                    service_window_end = (df_diagrams["Depart_Time"].min() + timedelta(hours=18))
+                    
+                    # Check eligibility at different levels
+                    perfect_eligible = len(df_ext[df_ext.apply(
+                        lambda x: _cert_valid_for_service(x, service_window_end) and 
+                        not (x["Has_Maintenance"] and x["Maintenance_Priority"] == "CRITICAL"), axis=1)])
+                    
+                    relaxed_window = service_window_end - timedelta(days=7)
+                    relaxed_eligible = len(df_ext[df_ext.apply(
+                        lambda x: _cert_valid_for_service(x, relaxed_window) and 
+                        not (x["Has_Maintenance"] and x["Maintenance_Priority"] == "CRITICAL"), axis=1)])
+                    
+                    emergency_eligible = len(df_ext[df_ext.apply(
+                        lambda x: not (x["Has_Maintenance"] and x["Maintenance_Priority"] == "CRITICAL"), axis=1)])
+                    
+                    st.error(f"❌ **Optimization Failed!** Status: {status_name}")
+                    st.markdown(f"""
+                    **🔍 Debugging Info:**
+                    - Required trains for service: **{required_trains}**
+                    - Total trains available: **{total_trains}**
+                    - Perfect eligible trains: **{perfect_eligible}** (valid certs, no critical maint.)
+                    - Relaxed eligible trains: **{relaxed_eligible}** (7-day expired certs OK)
+                    - Emergency eligible trains: **{emergency_eligible}** (only critical maint. blocked)
+                    - Available bays: **{len(df_bays)}**
+                    - Cleaning slots capacity: **{df_slots['Capacity'].sum()}**
+                    
+                    **💡 Suggestions:**
+                    - If perfect eligible < required: Try **{max(1, perfect_eligible - 1)}** required trains
+                    - If relaxed eligible < required: Try **{max(1, relaxed_eligible - 1)}** required trains  
+                    - Use "Load Feasible Test Data" for guaranteed working scenario
+                    - Check certificate expiry dates and maintenance priorities
+                    - Consider if cleaning capacity ({df_slots['Capacity'].sum()} slots) is sufficient
+                    """)
+                    
+                    # Show train eligibility breakdown
+                    if st.checkbox("Show detailed train eligibility"):
+                        eligibility_data = []
+                        for idx, train in df_ext.iterrows():
+                            perfect = (_cert_valid_for_service(train, service_window_end) and 
+                                     not (train["Has_Maintenance"] and train["Maintenance_Priority"] == "CRITICAL"))
+                            relaxed = (_cert_valid_for_service(train, relaxed_window) and 
+                                     not (train["Has_Maintenance"] and train["Maintenance_Priority"] == "CRITICAL"))
+                            emergency = not (train["Has_Maintenance"] and train["Maintenance_Priority"] == "CRITICAL")
+                            
+                            eligibility_data.append({
+                                "Train_ID": train["Train_ID"],
+                                "Perfect": "✅" if perfect else "❌",
+                                "Relaxed": "✅" if relaxed else "❌", 
+                                "Emergency": "✅" if emergency else "❌",
+                                "Maintenance": train["Maintenance_Priority"] if train["Has_Maintenance"] else "None"
+                            })
+                        
+                        eligibility_df = pd.DataFrame(eligibility_data)
+                        st.dataframe(eligibility_df, use_container_width=True, hide_index=True)
+                
+                # Force rerun to update the UI and switch to results tab
+                if plan["status"] in (cp_model.OPTIMAL, cp_model.FEASIBLE):
+                    st.session_state.show_optimization_results = True
+                st.rerun()
+
+    # Load or generate data
+    if st.session_state.train_data is None:
+        st.session_state.train_data = generate_sample_data()
+
+    df = st.session_state.train_data
+
+    # Tabs
+    tab1, tab2, tab3, tab4, tab5 = st.tabs(["📊 Dashboard", "🎯 Optimization Results",
+                                            "📈 Analytics", "🔮 What-If Analysis", "📚 Fleet Status"])
+
+    # ── Tab 1: Dashboard
+    with tab1:
+        col1, col2, col3, col4 = st.columns(4)
+
+        with col1:
+            available_trains = len(df[df.apply(lambda x: calculate_train_score(x, {'mileage':1.0,'certificates':1.2,'branding':1.5,'cleaning':0.8,'stabling':0.6}) > 0, axis=1)])
+            st.metric("Available Trains", f"{available_trains}/25", delta=f"{available_trains-18} vs required")
+
+        with col2:
+            avg_mileage = df['Total_Mileage'].mean()
+            st.metric("Avg Fleet Mileage", f"{avg_mileage:,.0f} km", delta="± balance target 80k")
+
+        with col3:
+            critical_maintenance = len(df[df['Maintenance_Priority'] == 'CRITICAL'])
+            st.metric("Critical Maintenance", critical_maintenance, delta="Needs attention" if critical_maintenance > 0 else "All clear")
+
+        with col4:
+            branding_trains = len(df[df['Has_Branding'] == True])
+            st.metric("Branding Contracts", branding_trains, delta=f"{int(df['Brand_Hours_Required'].sum())} hrs required tonight (synthetic)")
+
+        # Alerts
+        st.subheader("⚠️ System Alerts")
+        critical_alerts, warning_alerts = [], []
+        now = datetime.now()
+        for _, train in df.iterrows():
+            if train['Signal_Cert_Expiry'] < now or train['Brake_Cert_Expiry'] < now or train['Safety_Cert_Expiry'] < now:
+                critical_alerts.append(f"{train['Train_ID']}: A certificate is expired.")
+            else:
+                days_to_signal = (train['Signal_Cert_Expiry'] - now).days
+                if days_to_signal < 7:
+                    warning_alerts.append(f"{train['Train_ID']}: Signal certificate expires in {days_to_signal} days.")
+            if train['Has_Maintenance'] and train['Maintenance_Priority'] == 'CRITICAL':
+                critical_alerts.append(f"{train['Train_ID']}: Critical maintenance required.")
+
+        if critical_alerts:
+            for alert in critical_alerts[:3]:
+                st.markdown(f'<div class="alert-box alert-critical">🚨 {alert}</div>', unsafe_allow_html=True)
+        if warning_alerts:
+            for alert in warning_alerts[:2]:
+                st.markdown(f'<div class="alert-box alert-warning">⚠️ {alert}</div>', unsafe_allow_html=True)
+        if not critical_alerts and not warning_alerts:
+            st.markdown('<div class="alert-box alert-success">✅ All systems operational</div>', unsafe_allow_html=True)
+
+        # Simple Fleet Visualizations
+        st.subheader("🚇 Fleet Status Dashboard")
+        
+        # Color-Coded List only (user requested)
+        st.markdown("#### 📋 Train Status List")
+
+        # Prepare simple data for color-coded list
+        simple_data = []
+        now = datetime.now()
+
+        for _, train in df.iterrows():
+            # Determine status and icon/color
+            if train['Signal_Cert_Expiry'] < now or train['Brake_Cert_Expiry'] < now or train['Safety_Cert_Expiry'] < now:
+                status = "🚫 Certificate Expired"
+                status_color = "🔴"
+            elif train['Has_Maintenance'] and train['Maintenance_Priority'] == 'CRITICAL':
+                status = "🔧 Critical Maintenance"
+                status_color = "🔴"
+            elif train['Has_Maintenance']:
+                status = f"⚠️ {train['Maintenance_Priority']} Maintenance"
+                status_color = "🟡"
+            else:
+                status = "✅ Available"
+                status_color = "🟢"
+
+            cert_days = min([
+                (train['Signal_Cert_Expiry'] - now).days,
+                (train['Brake_Cert_Expiry'] - now).days,
+                (train['Safety_Cert_Expiry'] - now).days
+            ])
+
+            simple_data.append({
+                'Status': status_color,
+                'Train ID': train['Train_ID'],
+                'Current Status': status,
+                'Bay': train['Stabling_Bay'],
+                'Cert Days Left': max(0, cert_days),
+                'Mileage': f"{train['Total_Mileage']:,} km"
+            })
+
+        simple_df = pd.DataFrame(simple_data)
+        st.dataframe(simple_df, use_container_width=True, hide_index=True)
+        
+        # Simple summary
+        st.markdown("---")
+        st.markdown("#### 📈 Quick Summary")
+        
+        now = datetime.now()
+        available = len(df[(df['Signal_Cert_Expiry'] >= now) & 
+                          (df['Brake_Cert_Expiry'] >= now) & 
+                          (df['Safety_Cert_Expiry'] >= now) & 
+                          ~((df['Has_Maintenance']) & (df['Maintenance_Priority'] == 'CRITICAL'))])
+        
+        maintenance = len(df[df['Has_Maintenance'] == True])
+        expired = len(df[(df['Signal_Cert_Expiry'] < now) | 
+                        (df['Brake_Cert_Expiry'] < now) | 
+                        (df['Safety_Cert_Expiry'] < now)])
+        
+        col1, col2, col3, col4 = st.columns(4)
+        with col1:
+            st.metric("🟢 Ready for Service", available, help="Trains ready for immediate deployment")
+        with col2:
+            st.metric("🟡 Under Maintenance", maintenance, help="Trains requiring maintenance attention")  
+        with col3:
+            st.metric("🔴 Certificate Issues", expired, help="Trains with expired certificates")
+        with col4:
+            efficiency = (available / len(df) * 100) if len(df) > 0 else 0
+            st.metric("⚡ Fleet Efficiency", f"{efficiency:.1f}%", help="Percentage of fleet ready for service")
+            # Modern grid layout with status indicators
+            st.markdown("####   Interactive Train Status Grid")
+            
+            # Prepare grid data with detailed status
+            grid_data = []
+            for _, train in df.iterrows():
+                score = calculate_train_score(train, {'mileage':1.0,'certificates':1.2,'branding':1.5,'cleaning':0.8,'stabling':0.6})
+                
+                # Determine detailed status
+                now = datetime.now()
+                if train['Signal_Cert_Expiry'] < now or train['Brake_Cert_Expiry'] < now or train['Safety_Cert_Expiry'] < now:
+                    status = "🚫 Cert Expired"
+                    color = "#ff4444"
+                elif train['Has_Maintenance'] and train['Maintenance_Priority'] == 'CRITICAL':
+                    status = "🔧 Critical Maint"
+                    color = "#ff8800"
+                elif train['Has_Maintenance'] and train['Maintenance_Priority'] in ['HIGH', 'MEDIUM']:
+                    status = "⚠️ Maintenance"
+                    color = "#ffcc00"
+                elif score < 50:
+                    status = "⚡ Low Score"
+                    color = "#ffaa44"
+                else:
+                    status = "✅ Available"
+                    color = "#44ff44"
+                
+                # Certificate days remaining
+                cert_days = min([
+                    (train['Signal_Cert_Expiry'] - now).days,
+                    (train['Brake_Cert_Expiry'] - now).days,
+                    (train['Safety_Cert_Expiry'] - now).days
+                ])
+                
+                grid_data.append({
+                    'Train_ID': train['Train_ID'],
+                    'Status': status,
+                    'Score': score,
+                    'Bay': train['Stabling_Bay'],
+                    'Mileage': train['Total_Mileage'],
+                    'Cert_Days': max(0, cert_days),
+                    'Color': color,
+                    'Brand': train['Brand_Name'] if train['Has_Branding'] else None
+                })
+            
+            grid_df = pd.DataFrame(grid_data)
+            
+            # Create interactive scatter plot as grid
+            fig = px.scatter(
+                grid_df, 
+                x=grid_df.index % 5,  # 5 columns
+                y=-(grid_df.index // 5),  # Rows (negative for top-to-bottom)
+                color='Score',
+                size='Mileage',
+                hover_data=['Train_ID', 'Status', 'Bay', 'Cert_Days', 'Brand'],
+                color_continuous_scale='RdYlGn',
+                title="Interactive Train Fleet Grid (hover for details)",
+                labels={'x': '', 'y': ''}
+            )
+            fig.update_traces(marker=dict(sizemin=10, sizeref=50, line=dict(width=2, color='white')))
+            fig.update_layout(
+                xaxis=dict(showgrid=False, showticklabels=False, zeroline=False),
+                yaxis=dict(showgrid=False, showticklabels=False, zeroline=False),
+                height=400
+            )
+            st.plotly_chart(fig, use_container_width=True)
+            
+        
+        # Add legend/explanation
+        with st.expander("ℹ️ Simple Visualization Guide"):
+            st.markdown("""
+            **🎴 Simple Status Cards**: Easy to scan lists grouped by train status - perfect for quick overview.
+            
+            **📋 Color-Coded List**: Table format with color indicators and key information like certificate days remaining.
+            
+            **📊 Basic Bar Charts**: Simple bar charts showing status distribution and bay usage - great for managers.
+            
+            **🚦 Traffic Light Grid**: Visual grid using traffic light colors - red (problem), yellow (caution), green (ready).
+            
+            **Why Simple?** These visualizations focus on the key information you need for daily operations without overwhelming detail.
+            """)
+
+    # ── Tab 2: Optimization Results
+    with tab2:
+        st.subheader("🎯 Optimization Results")
+        
+        # Show fresh results notification
+        if st.session_state.get('show_optimization_results', False):
+            st.success("🎉 **Fresh optimization results below!** The algorithm has just completed analysis.")
+            st.session_state.show_optimization_results = False  # Clear the flag
+        
+        store = st.session_state.optimization_results
+        if store and store.get("plan"):
+            plan = store["plan"]
+            df_diagrams = store["diagrams"]
+            
+            # Show solver status and eligibility mode
+            status_names = {
+                cp_model.OPTIMAL: "✅ OPTIMAL",
+                cp_model.FEASIBLE: "⚠️ FEASIBLE", 
+                cp_model.INFEASIBLE: "❌ INFEASIBLE",
+                cp_model.MODEL_INVALID: "❌ MODEL_INVALID",
+                cp_model.UNKNOWN: "❓ UNKNOWN"
+            }
+            status_display = status_names.get(plan["status"], f"Status {plan['status']}")
+            eligibility_modes = {
+                "perfect": "🟢 Perfect (all certs valid, no critical maintenance)",
+                "valid_certs": "🟡 Valid certificates (high maintenance allowed)",
+                "relaxed_certs": "🟠 Relaxed (7-day expired certs allowed)",
+                "emergency": "🔴 Emergency (only critical maintenance blocked)"
+            }
+            eligibility_display = eligibility_modes.get(plan.get("eligibility_mode", "unknown"), "Unknown")
+            
+            st.markdown(f"**Solver Status:** {status_display}")
+            st.markdown(f"**Eligibility Mode:** {eligibility_display}")
+            
+            if plan.get("cleaning_issues"):
+                st.warning(f"⚠️ **Cleaning Issues:** {len(plan['cleaning_issues'])} trains need cleaning but couldn't get slots")
+                with st.expander("View cleaning issues"):
+                    for issue in plan["cleaning_issues"]:
+                        st.write(f"• {issue}")
+            
+            if plan["status"] in (cp_model.OPTIMAL, cp_model.FEASIBLE):
+                # Before/After comparison
+                st.markdown("#### 🔄 **Optimization Impact**")
+                impact_col1, impact_col2 = st.columns(2)
+                
+                with impact_col1:
+                    st.markdown("**📊 Before Optimization:**")
+                    total_trains = len(store["trains_ext"])
+                    available_trains = len(store["trains_ext"][store["trains_ext"].apply(
+                        lambda x: _cert_valid_for_service(x, datetime.now() + timedelta(hours=18)) and 
+                        not (x["Has_Maintenance"] and x["Maintenance_Priority"] == "CRITICAL"), axis=1)])
+                    st.write(f"• Total Fleet: {total_trains} trains")
+                    st.write(f"• Available for Service: {available_trains} trains")
+                    st.write(f"• Required for Service: {required_trains} trains")
+                
+                with impact_col2:
+                    st.markdown("**🎯 After Optimization:**")
+                    assigned_service = len(plan["service"])
+                    assigned_standby = len(plan["standby"])
+                    assigned_ibl = len(plan["ibl"])
+                    st.write(f"• Assigned to Service: {assigned_service} trains")
+                    st.write(f"• On Standby: {assigned_standby} trains") 
+                    st.write(f"• In IBL Mode: {assigned_ibl} trains")
+                    efficiency = (assigned_service / required_trains * 100) if required_trains > 0 else 0
+                    st.write(f"• Service Efficiency: {efficiency:.1f}%")
+                
+                col1, col2, col3, col4 = st.columns(4)
+                with col1: st.metric("Service Assignments", len(plan["service"]))
+                with col2: st.metric("Standby", plan["kpis"].get("StandbyCount", 0))
+                with col3: st.metric("IBL", plan["kpis"].get("IBLCount", 0))
+                with col4: st.metric("Brand Shortfall (hrs)", plan["kpis"].get("BrandShortfallHours", 0))
+
+                st.markdown("### 🚆 Service Induction List")
+                svc_df = pd.DataFrame(plan["service"])
+                if not svc_df.empty:
+                    # Add a summary box with key insights
+                    with st.container():
+                        st.markdown("#### 📋 **Optimization Summary**")
+                        summary_col1, summary_col2, summary_col3 = st.columns(3)
+                        
+                        with summary_col1:
+                            total_km = sum([r["Planned_Km"] for r in plan["service"]])
+                            avg_km = total_km / len(plan["service"]) if plan["service"] else 0
+                            st.metric("Total Service Km", f"{total_km:,}", help="Combined kilometers for all service assignments")
+                            st.metric("Avg Duty Distance", f"{avg_km:.0f} km", help="Average kilometers per service train")
+                        
+                        with summary_col2:
+                            cleaning_count = len([r for r in plan["service"] if r["Cleaning_Slot"] != "-"])
+                            branded_count = len([r for r in plan["service"] if r["Brand"] != "-"])
+                            st.metric("Trains with Cleaning", cleaning_count, help="Service trains requiring overnight cleaning")
+                            st.metric("Branded Trains", branded_count, help="Service trains with advertising contracts")
+                        
+                        with summary_col3:
+                            ladder_a = len([r for r in plan["service"] if r["Bay"] and r["Bay"] <= 12])
+                            ladder_b = len([r for r in plan["service"] if r["Bay"] and r["Bay"] > 12])
+                            st.metric("Ladder A Usage", f"{ladder_a}/12", help="Service trains on Ladder A (bays 1-12)")
+                            st.metric("Ladder B Usage", f"{ladder_b}/13", help="Service trains on Ladder B (bays 13-25)")
+                    
+                    st.dataframe(svc_df, use_container_width=True, hide_index=True)
+                else:
+                    st.warning("⚠️ Solver found a solution but no trains were assigned to service. This may indicate all trains are in standby or IBL mode.")
+            else:
+                st.error("❌ Optimization failed to find a feasible solution. Please try:")
+                st.markdown("""
+                - Reducing the number of required trains
+                - Adjusting the optimization weights
+                - Checking if enough trains have valid certificates
+                - Ensuring trains are not all in critical maintenance
+                """)
+                return  # Skip the rest of the tab content
+
+            st.markdown("### 🧽 Cleaning Bookings")
+            if not svc_df.empty:
+                clean_df = svc_df[svc_df["Cleaning_Slot"] != "-"][["Train_ID","Diagram_ID","Cleaning_Slot"]]
+                if not clean_df.empty:
+                    st.dataframe(clean_df, use_container_width=True, hide_index=True)
+                else:
+                    st.info("No cleaning bookings required for serving trains.")
+
+            st.markdown("### 🅿️ Bay Plan")
+            bay_df = pd.DataFrame(
+                [{"Train_ID": t["Train_ID"], "Bay": t["Bay"], "Mode":"Service"} for t in plan["service"]] +
+                [{"Train_ID": t["Train_ID"], "Bay": t["Bay"], "Mode":"Standby"} for t in plan["standby"]] +
+                [{"Train_ID": t["Train_ID"], "Bay": t["Bay"], "Mode":"IBL"} for t in plan["ibl"]]
+            )
+            if not bay_df.empty:
+                st.dataframe(bay_df.sort_values(["Mode","Bay"]), use_container_width=True, hide_index=True)
+
+            # Downloads
+            if not svc_df.empty:
+                st.download_button(
+                    "📥 Download Service Plan (CSV)",
+                    svc_df.to_csv(index=False),
+                    file_name=f"service_plan_{datetime.now().strftime('%Y%m%d_%H%M')}.csv",
+                    mime="text/csv"
+                )
+        else:
+            st.info("👈 Click 'Run Optimization' in the sidebar to generate results")
+
+    # ── Tab 3: Analytics
+    with tab3:
+        st.subheader("📈 Analytics Dashboard")
+        col1, col2 = st.columns(2)
+
+        with col1:
+            fig = px.histogram(df, x='Total_Mileage', nbins=10,
+                               title='Fleet Mileage Distribution',
+                               labels={'Total_Mileage': 'Total Mileage (km)', 'count': 'Number of Trains'})
+            st.plotly_chart(fig, use_container_width=True)
+
+        with col2:
+            # Certificate expiries (Signal & Brake)
+            cert_data = []
+            now = datetime.now()
+            for _, train in df.iterrows():
+                cert_data.append({'Train': train['Train_ID'], 'Type': 'Signal', 'Start': now, 'Expiry': train['Signal_Cert_Expiry']})
+                cert_data.append({'Train': train['Train_ID'], 'Type': 'Brake',  'Start': now, 'Expiry': train['Brake_Cert_Expiry']})
+            cert_df = pd.DataFrame(cert_data)
+            cert_df = cert_df[cert_df['Expiry'] > now].sort_values('Expiry').head(10)
+            if not cert_df.empty:
+                fig = px.timeline(cert_df, x_start="Start", x_end="Expiry", y='Train', color='Type',
+                                  title='Upcoming Certificate Expirations')
+                st.plotly_chart(fig, use_container_width=True)
+            else:
+                st.info("No upcoming certificate expirations in range.")
+
+        col1, col2 = st.columns(2)
+        with col1:
+            maint_counts = df['Maintenance_Priority'].fillna('None').value_counts()
+            fig = px.pie(values=maint_counts.values, names=maint_counts.index,
+                         title='Maintenance Status Distribution')
+            st.plotly_chart(fig, use_container_width=True)
+        with col2:
+            # Stabling accessibility (updated for 1-25 bays)
+            cat = pd.cut(df['Stabling_Bay'], bins=[0,8,16,25], labels=['Easy','Medium','Hard'])
+            stabling_data = cat.value_counts().reindex(['Easy','Medium','Hard']).fillna(0)
+            fig = px.bar(x=stabling_data.index, y=stabling_data.values,
+                         title='Stabling Position Accessibility',
+                         labels={'x': 'Access Difficulty', 'y': 'Number of Trains'})
+            st.plotly_chart(fig, use_container_width=True)
+
+        # Historical optimisation score proxy
+        if len(st.session_state.historical_data) > 1:
+            st.subheader("📊 Historical Performance")
+            hist_scores = []
+            hist_times  = []
+            for h in st.session_state.historical_data:
+                svc = h['results']
+                if isinstance(svc, list) and len(svc) > 0 and 'Planned_Km' in svc[0]:
+                    # proxy score: mean planned km (for demo); replace with real KPI later
+                    hist_scores.append(np.mean([r['Planned_Km'] for r in svc]))
+                    hist_times.append(h['timestamp'])
+            if hist_scores:
+                fig = go.Figure()
+                fig.add_trace(go.Scatter(x=hist_times, y=hist_scores, mode='lines+markers', name='Avg Duty Km'))
+                fig.update_layout(title='Optimisation Trend (proxy)', xaxis_title='Time', yaxis_title='Avg Duty Km')
+                st.plotly_chart(fig, use_container_width=True)
+
+    # ── Tab 4: What-If Analysis
+    with tab4:
+        st.subheader("🔮 What-If Analysis")
+        if df.empty:
+            st.info("No fleet data.")
+        else:
+            col1, col2 = st.columns([1,2])
+            with col1:
+                selected_train = st.selectbox("Select Train to Modify", df['Train_ID'].tolist())
+                train_idx = df[df['Train_ID'] == selected_train].index[0]
+                current_train = df.iloc[train_idx]
+
+                # Current heuristic score (not the solver objective)
+                weights_live = {'mileage':1.0,'certificates':1.2,'branding':1.5,'cleaning':0.8,'stabling':0.6}
+                current_score = calculate_train_score(current_train, weights_live)
+                st.metric("Current Heuristic Score", f"{current_score:.1f}")
+
+                st.markdown("### Modify Parameters:")
+                new_mileage = st.number_input("Total Mileage (km)", value=int(current_train['Total_Mileage']),
+                                              min_value=0, max_value=200_000, step=1000)
+                new_bay = st.number_input("Stabling Bay", value=int(current_train['Stabling_Bay']),
+                                          min_value=1, max_value=25)
+                add_maintenance = st.checkbox("Add Maintenance Issue", value=bool(current_train['Has_Maintenance']))
+                maint_priority = st.selectbox("Maintenance Priority",
+                                              ['LOW','MEDIUM','HIGH','CRITICAL'],
+                                              index=0) if add_maintenance else None
+
+                if st.button("🔄 Simulate Changes"):
+                    modified = current_train.copy()
+                    modified['Total_Mileage'] = new_mileage
+                    modified['Stabling_Bay']  = new_bay
+                    modified['Has_Maintenance'] = add_maintenance
+                    modified['Maintenance_Priority'] = maint_priority
+                    new_score = calculate_train_score(modified, weights_live)
+
+                    with col2:
+                        st.markdown("### Impact Analysis")
+                        delta = new_score - current_score
+                        st.metric("New Heuristic Score", f"{new_score:.1f}", delta=f"{delta:+.1f} points")
+                        if new_score == 0:
+                            st.error("⛔ Train would be DISQUALIFIED by heuristic checks.")
+                        elif delta > 0:
+                            st.success(f"✅ Improvement of {delta:.1f} points")
+                        elif delta < 0:
+                            st.warning(f"⚠️ Reduction of {abs(delta):.1f} points")
+                        else:
+                            st.info("No change in score.")
+
+                        # Simple component breakdown
+                        components = {
+                            'Base': 100,
+                            'Mileage': (max(0, 100 - (abs(new_mileage - 80000) / 1000))) * weights_live['mileage'],
+                            'Stabling': (100 if new_bay <= 8 else 60 if new_bay <= 16 else 30) * weights_live['stabling'],
+                            'Maintenance': -30 if maint_priority == 'HIGH' else (-15 if maint_priority == 'MEDIUM' else (-5 if maint_priority == 'LOW' else 0))
+                        }
+                        fig = px.bar(x=list(components.keys()), y=list(components.values()),
+                                     title='Heuristic Score Component Breakdown',
+                                     labels={'x': 'Component', 'y': 'Score Contribution'})
+                        st.plotly_chart(fig, use_container_width=True)
+
+    # ── Tab 5: Fleet Status
+    with tab5:
+        st.subheader("📚 Complete Fleet Status")
+
+        col1, col2, col3 = st.columns(3)
+        with col1:
+            status_filter = st.multiselect("Filter by Status", ['Available', 'Maintenance', 'Expired Cert'],
+                                           default=['Available', 'Maintenance', 'Expired Cert'])
+        with col2:
+            mileage_min, mileage_max = int(df['Total_Mileage'].min()), int(df['Total_Mileage'].max())
+            mileage_range = st.slider("Mileage Range (km)", mileage_min, mileage_max, (mileage_min, mileage_max))
+        with col3:
+            sort_by = st.selectbox("Sort by", ['Train_ID', 'Total_Mileage', 'Score'])
+
+        display_rows = []
+        now = datetime.now()
+        with col3:
+            sort_by = st.selectbox("Sort by", ['Train ID', 'Total Mileage', 'Score'])
+            df['Telecom_Cert_Expiry'] = df['Safety_Cert_Expiry']
+        for _, t in df.iterrows():
+            score = calculate_train_score(t, {'mileage':1.0,'certificates':1.2,'branding':1.5,'cleaning':0.8,'stabling':0.6})
+            if (t['Signal_Cert_Expiry'] < now or t['Brake_Cert_Expiry'] < now or t['Safety_Cert_Expiry'] < now):
+                status = 'Expired Cert'
+            elif t['Has_Maintenance']:
+                status = 'Maintenance'
+            else:
+                status = 'Available'
+
+            if status in status_filter and mileage_range[0] <= t['Total_Mileage'] <= mileage_range[1]:
+                display_rows.append({
+                    'Train ID': t['Train_ID'],
+                    'Status': status,
+                    'Score': score,
+                    'Total Mileage': f"{t['Total_Mileage']:,}",
+                    'Monthly Mileage': f"{t['Monthly_Mileage']:,}",
+                    'Bay': t['Stabling_Bay'],
+                    'Branding': t['Brand_Name'] if t['Has_Branding'] else '-',
+                    'Next Cleaning': t['Next_Cleaning'].strftime('%Y-%m-%d'),
+                    'Maintenance': t['Maintenance_Priority'] if t['Has_Maintenance'] else '-'
+                })
+
+        if display_rows:
+            display_df = pd.DataFrame(display_rows)
+            if sort_by == 'Score':
+                display_df = display_df.sort_values('Score', ascending=False)
+            elif sort_by == 'Total_Mileage':
+                # Sort by numeric
+                tmp = display_df.copy()
+                tmp['_m'] = tmp['Total Mileage'].str.replace(',', '', regex=False).astype(int)
+                display_df = tmp.sort_values('_m', ascending=False).drop(columns=['_m'])
+            else:
+                display_df = display_df.sort_values(sort_by)
+
+            st.dataframe(display_df, use_container_width=True, hide_index=True)
+
+            csv = display_df.to_csv(index=False)
+            st.download_button(
+                label="📥 Export Fleet Data",
+                data=csv,
+                file_name=f"fleet_data_{datetime.now().strftime('%Y%m%d_%H%M')}.csv",
+                mime="text/csv"
+            )
+        else:
+            st.info("No trains match the selected filters.")
+
+if __name__ == "__main__":
+    main()
