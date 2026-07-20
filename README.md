@@ -15,7 +15,7 @@ Processes raw, unformatted, multi-source inputs — including ISO strings, legac
 
 Replaces heuristic scorecards with a unified mathematical optimization model using the Google OR-Tools CP-SAT solver. Conflicting scheduling goals — mileage balance, stabling-bay friction, and certificate runway — are combined into a single objective function:
 
-$\min \left( W_{\text{mileage}} \sum_{t \in T} (d^+_t + d^-_t) + W_{\text{stabling}} \sum_{t \in T} \sum_{b \in B} C_b y_{tb} - W_{\text{certs}} \sum_{t \in T} M_t \sum_{d \in D} x_{td} \right)$$
+$$\min \left( W_{\text{mileage}} \sum_{t \in T} (d^+_t + d^-_t) + W_{\text{stabling}} \sum_{t \in T} \sum_{b \in B} C_b y_{tb} - W_{\text{certs}} \sum_{t \in T} M_t \sum_{d \in D} x_{td} \right)$$
 
 Where:
 - $x_{td} \in \{0, 1\}$: whether Train $t$ is assigned to Diagram $d$
